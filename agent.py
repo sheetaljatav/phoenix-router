@@ -15,8 +15,11 @@ import time
 import urllib.request
 
 START = time.time()
-# hard wall: harness kills us at 10 min (DEADLINE_MIN is a local-test knob)
-DEADLINE = START + float(os.environ.get("DEADLINE_MIN", "8.5")) * 60
+# The harness kills the container at 10 min. Finish well inside that: this
+# leaves ~2.5 min of headroom for model load, the final results write, and
+# any container/scheduling overhead the harness counts against the cap.
+# DEADLINE_MIN overrides it (used to stretch the budget on the slow dev laptop).
+DEADLINE = START + float(os.environ.get("DEADLINE_MIN", "7.5")) * 60
 LLAMA_BASE = os.environ.get("LLAMA_BASE", "http://127.0.0.1:8080")
 LLAMA_URL = LLAMA_BASE + "/v1/chat/completions"
 
@@ -182,8 +185,9 @@ class Local:
 
     def ask(self, prompt, cfg, max_tokens, think, temperature=0.0):
         sys_prompt = cfg["sys"]
-        # hard wall-clock cap: never let one request outlive the run budget
-        cap = max(20, min(600, int(DEADLINE - time.time()) + 30))
+        # per-request timeout: shrinks toward the deadline, and is capped at
+        # 180s so one hung generation can never consume the whole run budget
+        cap = max(20, min(180, int(DEADLINE - time.time()) + 30))
         t0 = time.time()
         out = post_json(LLAMA_URL, {
             "messages": [
