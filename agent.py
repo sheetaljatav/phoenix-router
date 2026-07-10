@@ -34,8 +34,23 @@ CATEGORIES = (
     ("ner", re.compile(r"named entit|entit(y|ies)\b|\b(identify|list|find|extract|label)\b.*\b(people|persons?|organi[sz]ations?|locations?|dates)\b|\b(people|persons?|organi[sz]ations?|locations?|dates)\b.*\b(identify|list|find|extract|label)", re.I | re.S)),
     ("sentiment", re.compile(r"\bsentiment\b|classify.*\b(review|tweet|feedback|comment)|positive.*negative", re.I)),
     ("code_debug", re.compile(r"(bug|fix|debug|error|incorrect|wrong|broken|doesn'?t work|fails?\b).*\b(code|function|def |script|program|implementation)|\b(code|function|def |script|program)\b.*\b(bug|fix|debug|has an? error|incorrect|broken)", re.I | re.S)),
-    ("code_gen", re.compile(r"(write|implement|create|build|develop)\b.*\b(function|program|script|class|method|code)", re.I)),
-    ("math", re.compile(r"\d.*(how (many|much)|calculate|compute|total|percent|%|remain|left over|cost|price|profit|revenue|average|sum of|difference|product of|per\b|each\b|altogether|in all)|what is \d|\d\s*[-+*/^]\s*\d", re.I | re.S)),
+    ("code_gen", re.compile(
+        r"\b(write|implement|create|build|develop|code|generate|design)\b"
+        r"[^.\n]{0,70}\b(function|program|script|class|method|module|code|"
+        r"algorithm|snippet|one[- ]?liner|regex|parser|api|endpoint|"
+        r"data ?structure|stack|queue|linked[- ]?list|binary search|hash ?map)\b"
+        r"|\b(write|implement|create|code|generate)\b[^.\n]{0,70}\b(in|using)\s+"
+        r"(python|java(script)?|typescript|c\+\+|c#|golang|go|rust|ruby|php|sql|bash)\b",
+        re.I)),
+    ("math", re.compile(
+        r"\d.*\b(how (many|much|far|long|fast|old|tall|wide|deep)|calculate|"
+        r"compute|evaluate|simplify|total|percent|remain|left over|cost|price|"
+        r"profit|revenue|average|sum|difference|product|per\b|each\b|"
+        r"altogether|in all)\b"
+        r"|\b(calculate|compute|evaluate|simplify|how (many|much|far|long|fast|"
+        r"old|tall|wide|deep))\b.*\d"
+        r"|what is \d|\d\s*[-+*/^=]\s*\d|solve for\b|solve the equation|%",
+        re.I | re.S)),
     ("logic", re.compile(r"who (owns|has|is|likes|lives)|each (own|have|like|live)|exactly one|either\b.*\bor\b|neither|logic|puzzle|deduce|seated|sits|taller|older than|younger than|to the (left|right) of", re.I)),
 )
 
@@ -152,10 +167,14 @@ def clean(text: str) -> str:
 class Local:
     def __init__(self):
         self.tps = 10.0  # generation speed estimate, refined per request
+        self.ok = False
 
     def wait(self, timeout=None):
-        # wait as long as the run budget allows, minus room to answer
-        end = DEADLINE - 60 if timeout is None else time.time() + timeout
+        # Wait for the model server, but never burn more than 4 min on it: if
+        # it hasn't come up by then it probably won't, and we must leave time
+        # to answer (via the Fireworks safety net) before the deadline.
+        end = (min(DEADLINE - 60, time.time() + 240) if timeout is None
+               else time.time() + timeout)
         up = False
         while time.time() < end:
             try:
@@ -342,6 +361,23 @@ def ask_fireworks(prompt, cfg):
 
 # -------------------------------------------------------------------- main
 
+# Module-level so the crash handler can flush whatever we have. Every entry is
+# seeded with a placeholder and overwritten as tasks complete, guaranteeing a
+# valid answer for every task_id even if the process dies mid-run.
+RESULTS = []
+DEFAULT_ANSWER = "Unable to answer within constraints."
+
+
+def write_output():
+    """Atomically write RESULTS to OUTPUT_PATH (never leaves a partial file)."""
+    d = os.path.dirname(OUTPUT_PATH) or "."
+    os.makedirs(d, exist_ok=True)
+    tmp = OUTPUT_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(RESULTS, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, OUTPUT_PATH)
+
+
 def solve(task, local, tasks_left):
     prompt = task.get("prompt", "")
     cfg = CONFIG[classify(prompt)]
@@ -407,32 +443,54 @@ def solve(task, local, tasks_left):
     return answer or "Unable to answer within constraints."
 
 
+def load_tasks():
+    with open(INPUT_PATH, encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict):  # tolerate {"tasks": [...]} shapes
+        for v in data.values():
+            if isinstance(v, list):
+                return v
+        return []
+    return data if isinstance(data, list) else []
+
+
 def main():
-    with open(INPUT_PATH) as f:
-        tasks = json.load(f)
+    global RESULTS
+    tasks = load_tasks()
+
+    # Seed every task_id with a placeholder and flush immediately, so a valid
+    # results file exists from the start no matter what happens next.
+    RESULTS = [{"task_id": (t.get("task_id", str(i)) if isinstance(t, dict)
+                            else str(i)), "answer": DEFAULT_ANSWER}
+               for i, t in enumerate(tasks)]
+    write_output()
+    if not tasks:
+        return
 
     local = Local()
     local.ok = local.wait()
 
     # easy (no-think) categories first: if time gets tight, only the
     # reasoning-heavy tasks see shrunken budgets
-    order = sorted(range(len(tasks)),
-                   key=lambda i: CONFIG[classify(tasks[i].get("prompt", ""))]["think"])
-    answers = {}
+    def think_key(i):
+        t = tasks[i]
+        p = t.get("prompt", "") if isinstance(t, dict) else ""
+        return CONFIG[classify(p)]["think"]
+
+    order = sorted(range(len(tasks)), key=think_key)
     for n, i in enumerate(order):
-        task = tasks[i]
-        answer = solve(task, local, len(tasks) - n)
-        answers[i] = answer
-        print(f"[{n+1}/{len(tasks)}] {task.get('task_id')} "
+        task = tasks[i] if isinstance(tasks[i], dict) else {}
+        try:
+            answer = solve(task, local, len(tasks) - n)
+        except Exception as e:  # a single bad task must never sink the run
+            print(f"[solve fatal] {task.get('task_id')}: {e}", file=sys.stderr)
+            answer = DEFAULT_ANSWER
+        RESULTS[i]["answer"] = answer or DEFAULT_ANSWER
+        write_output()  # persist progress after every task
+        print(f"[{n+1}/{len(tasks)}] {RESULTS[i]['task_id']} "
               f"cat={classify(task.get('prompt', ''))} len={len(answer)} "
               f"tps={local.tps:.1f} t={time.time()-START:.0f}s", flush=True)
 
-    results = [{"task_id": t.get("task_id", str(i)), "answer": answers[i]}
-               for i, t in enumerate(tasks)]
-
-    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
-    with open(OUTPUT_PATH, "w") as f:
-        json.dump(results, f, ensure_ascii=False, indent=1)
     print(f"done in {time.time()-START:.0f}s", flush=True)
 
 
@@ -440,13 +498,10 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        # never exit non-zero without writing *something*
         print(f"[fatal] {e}", file=sys.stderr)
-        try:
-            os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
-            if not os.path.exists(OUTPUT_PATH):
-                with open(OUTPUT_PATH, "w") as f:
-                    json.dump([], f)
-        except Exception:
-            pass
+    # Always leave a valid results file behind, whatever happened above.
+    try:
+        write_output()
+    except Exception as e2:
+        print(f"[output fatal] {e2}", file=sys.stderr)
     sys.exit(0)
