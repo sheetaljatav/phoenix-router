@@ -1,4 +1,4 @@
-# ZeroToken Router — Track 1: Hybrid Token-Efficient Routing Agent
+# Phoenix Router — Track 1: Hybrid Token-Efficient Routing Agent
 
 **AMD Developer Hackathon: ACT II — Track 1 submission.**
 
@@ -55,11 +55,11 @@ job is to make sure the Fireworks safety net is (almost) never needed.
 ```bash
 # linux/amd64 as required by the judging VM; the model weights (~1.3 GB)
 # are downloaded from Hugging Face during the build
-docker buildx build --platform linux/amd64 -t zerotoken-router:latest .
+docker buildx build --platform linux/amd64 -t phoenix-router:latest .
 ```
 
 CI: every push to `main` rebuilds and publishes
-`ghcr.io/sheetaljatav/zerotoken-router:latest` via GitHub Actions
+`ghcr.io/sheetaljatav/phoenix-router:latest` via GitHub Actions
 ([.github/workflows/build.yml](.github/workflows/build.yml)).
 
 ## Run locally
@@ -67,7 +67,7 @@ CI: every push to `main` rebuilds and publishes
 ```bash
 docker run --rm --cpus=2 --memory=4g \
   -v "$PWD/input:/input:ro" -v "$PWD/output:/output" \
-  zerotoken-router:latest
+  phoenix-router:latest
 cat output/results.json
 ```
 
