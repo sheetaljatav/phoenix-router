@@ -306,10 +306,19 @@ def fireworks_model():
     models = [m.strip() for m in os.environ.get("ALLOWED_MODELS", "").split(",") if m.strip()]
     if not models:
         return None
-    # prefer the smallest/cheapest model by parameter-count hints in the id
+
     def size_key(mid):
         hits = re.findall(r"(\d+(?:\.\d+)?)[bB]\b", mid)
         return min([float(h) for h in hits], default=999.0)
+
+    # Gemma is our designated cloud escalation model: whenever the local path
+    # cannot answer, we escalate to the smallest available Gemma "via Fireworks"
+    # (FIREWORKS_BASE_URL). This keeps every escalation on Gemma while our
+    # local-first design keeps the count of such calls near zero.
+    gemma = [m for m in models if "gemma" in m.lower()]
+    if gemma:
+        return sorted(gemma, key=size_key)[0]
+    # no Gemma in the allowed list -> fall back to the cheapest model overall
     return sorted(models, key=size_key)[0]
 
 
