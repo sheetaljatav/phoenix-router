@@ -15,11 +15,8 @@ import time
 import urllib.request
 
 START = time.time()
-# The harness kills the container at 10 min. Finish well inside that: this
-# leaves ~2.5 min of headroom for model load, the final results write, and
-# any container/scheduling overhead the harness counts against the cap.
-# DEADLINE_MIN overrides it (used to stretch the budget on the slow dev laptop).
-DEADLINE = START + float(os.environ.get("DEADLINE_MIN", "7.5")) * 60
+# hard wall: harness kills us at 10 min (DEADLINE_MIN is a local-test knob)
+DEADLINE = START + float(os.environ.get("DEADLINE_MIN", "8.5")) * 60
 LLAMA_BASE = os.environ.get("LLAMA_BASE", "http://127.0.0.1:8080")
 LLAMA_URL = LLAMA_BASE + "/v1/chat/completions"
 
@@ -34,23 +31,8 @@ CATEGORIES = (
     ("ner", re.compile(r"named entit|entit(y|ies)\b|\b(identify|list|find|extract|label)\b.*\b(people|persons?|organi[sz]ations?|locations?|dates)\b|\b(people|persons?|organi[sz]ations?|locations?|dates)\b.*\b(identify|list|find|extract|label)", re.I | re.S)),
     ("sentiment", re.compile(r"\bsentiment\b|classify.*\b(review|tweet|feedback|comment)|positive.*negative", re.I)),
     ("code_debug", re.compile(r"(bug|fix|debug|error|incorrect|wrong|broken|doesn'?t work|fails?\b).*\b(code|function|def |script|program|implementation)|\b(code|function|def |script|program)\b.*\b(bug|fix|debug|has an? error|incorrect|broken)", re.I | re.S)),
-    ("code_gen", re.compile(
-        r"\b(write|implement|create|build|develop|code|generate|design)\b"
-        r"[^.\n]{0,70}\b(function|program|script|class|method|module|code|"
-        r"algorithm|snippet|one[- ]?liner|regex|parser|api|endpoint|"
-        r"data ?structure|stack|queue|linked[- ]?list|binary search|hash ?map)\b"
-        r"|\b(write|implement|create|code|generate)\b[^.\n]{0,70}\b(in|using)\s+"
-        r"(python|java(script)?|typescript|c\+\+|c#|golang|go|rust|ruby|php|sql|bash)\b",
-        re.I)),
-    ("math", re.compile(
-        r"\d.*\b(how (many|much|far|long|fast|old|tall|wide|deep)|calculate|"
-        r"compute|evaluate|simplify|total|percent|remain|left over|cost|price|"
-        r"profit|revenue|average|sum|difference|product|per\b|each\b|"
-        r"altogether|in all)\b"
-        r"|\b(calculate|compute|evaluate|simplify|how (many|much|far|long|fast|"
-        r"old|tall|wide|deep))\b.*\d"
-        r"|what is \d|\d\s*[-+*/^=]\s*\d|solve for\b|solve the equation|%",
-        re.I | re.S)),
+    ("code_gen", re.compile(r"(write|implement|create|build|develop)\b.*\b(function|program|script|class|method|code)", re.I)),
+    ("math", re.compile(r"\d.*(how (many|much)|calculate|compute|total|percent|%|remain|left over|cost|price|profit|revenue|average|sum of|difference|product of|per\b|each\b|altogether|in all)|what is \d|\d\s*[-+*/^]\s*\d", re.I | re.S)),
     ("logic", re.compile(r"who (owns|has|is|likes|lives)|each (own|have|like|live)|exactly one|either\b.*\bor\b|neither|logic|puzzle|deduce|seated|sits|taller|older than|younger than|to the (left|right) of", re.I)),
 )
 
@@ -167,14 +149,10 @@ def clean(text: str) -> str:
 class Local:
     def __init__(self):
         self.tps = 10.0  # generation speed estimate, refined per request
-        self.ok = False
 
     def wait(self, timeout=None):
-        # Wait for the model server, but never burn more than 4 min on it: if
-        # it hasn't come up by then it probably won't, and we must leave time
-        # to answer (via the Fireworks safety net) before the deadline.
-        end = (min(DEADLINE - 60, time.time() + 240) if timeout is None
-               else time.time() + timeout)
+        # wait as long as the run budget allows, minus room to answer
+        end = DEADLINE - 60 if timeout is None else time.time() + timeout
         up = False
         while time.time() < end:
             try:
@@ -204,9 +182,8 @@ class Local:
 
     def ask(self, prompt, cfg, max_tokens, think, temperature=0.0):
         sys_prompt = cfg["sys"]
-        # per-request timeout: shrinks toward the deadline, and is capped at
-        # 180s so one hung generation can never consume the whole run budget
-        cap = max(20, min(180, int(DEADLINE - time.time()) + 30))
+        # hard wall-clock cap: never let one request outlive the run budget
+        cap = max(20, min(600, int(DEADLINE - time.time()) + 30))
         t0 = time.time()
         out = post_json(LLAMA_URL, {
             "messages": [
@@ -325,19 +302,10 @@ def fireworks_model():
     models = [m.strip() for m in os.environ.get("ALLOWED_MODELS", "").split(",") if m.strip()]
     if not models:
         return None
-
+    # prefer the smallest/cheapest model by parameter-count hints in the id
     def size_key(mid):
         hits = re.findall(r"(\d+(?:\.\d+)?)[bB]\b", mid)
         return min([float(h) for h in hits], default=999.0)
-
-    # Gemma is our designated cloud escalation model: whenever the local path
-    # cannot answer, we escalate to the smallest available Gemma "via Fireworks"
-    # (FIREWORKS_BASE_URL). This keeps every escalation on Gemma while our
-    # local-first design keeps the count of such calls near zero.
-    gemma = [m for m in models if "gemma" in m.lower()]
-    if gemma:
-        return sorted(gemma, key=size_key)[0]
-    # no Gemma in the allowed list -> fall back to the cheapest model overall
     return sorted(models, key=size_key)[0]
 
 
@@ -360,23 +328,6 @@ def ask_fireworks(prompt, cfg):
 
 
 # -------------------------------------------------------------------- main
-
-# Module-level so the crash handler can flush whatever we have. Every entry is
-# seeded with a placeholder and overwritten as tasks complete, guaranteeing a
-# valid answer for every task_id even if the process dies mid-run.
-RESULTS = []
-DEFAULT_ANSWER = "Unable to answer within constraints."
-
-
-def write_output():
-    """Atomically write RESULTS to OUTPUT_PATH (never leaves a partial file)."""
-    d = os.path.dirname(OUTPUT_PATH) or "."
-    os.makedirs(d, exist_ok=True)
-    tmp = OUTPUT_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(RESULTS, f, ensure_ascii=False, indent=1)
-    os.replace(tmp, OUTPUT_PATH)
-
 
 def solve(task, local, tasks_left):
     prompt = task.get("prompt", "")
@@ -443,54 +394,32 @@ def solve(task, local, tasks_left):
     return answer or "Unable to answer within constraints."
 
 
-def load_tasks():
-    with open(INPUT_PATH, encoding="utf-8") as f:
-        data = json.load(f)
-    if isinstance(data, dict):  # tolerate {"tasks": [...]} shapes
-        for v in data.values():
-            if isinstance(v, list):
-                return v
-        return []
-    return data if isinstance(data, list) else []
-
-
 def main():
-    global RESULTS
-    tasks = load_tasks()
-
-    # Seed every task_id with a placeholder and flush immediately, so a valid
-    # results file exists from the start no matter what happens next.
-    RESULTS = [{"task_id": (t.get("task_id", str(i)) if isinstance(t, dict)
-                            else str(i)), "answer": DEFAULT_ANSWER}
-               for i, t in enumerate(tasks)]
-    write_output()
-    if not tasks:
-        return
+    with open(INPUT_PATH) as f:
+        tasks = json.load(f)
 
     local = Local()
     local.ok = local.wait()
 
     # easy (no-think) categories first: if time gets tight, only the
     # reasoning-heavy tasks see shrunken budgets
-    def think_key(i):
-        t = tasks[i]
-        p = t.get("prompt", "") if isinstance(t, dict) else ""
-        return CONFIG[classify(p)]["think"]
-
-    order = sorted(range(len(tasks)), key=think_key)
+    order = sorted(range(len(tasks)),
+                   key=lambda i: CONFIG[classify(tasks[i].get("prompt", ""))]["think"])
+    answers = {}
     for n, i in enumerate(order):
-        task = tasks[i] if isinstance(tasks[i], dict) else {}
-        try:
-            answer = solve(task, local, len(tasks) - n)
-        except Exception as e:  # a single bad task must never sink the run
-            print(f"[solve fatal] {task.get('task_id')}: {e}", file=sys.stderr)
-            answer = DEFAULT_ANSWER
-        RESULTS[i]["answer"] = answer or DEFAULT_ANSWER
-        write_output()  # persist progress after every task
-        print(f"[{n+1}/{len(tasks)}] {RESULTS[i]['task_id']} "
+        task = tasks[i]
+        answer = solve(task, local, len(tasks) - n)
+        answers[i] = answer
+        print(f"[{n+1}/{len(tasks)}] {task.get('task_id')} "
               f"cat={classify(task.get('prompt', ''))} len={len(answer)} "
               f"tps={local.tps:.1f} t={time.time()-START:.0f}s", flush=True)
 
+    results = [{"task_id": t.get("task_id", str(i)), "answer": answers[i]}
+               for i, t in enumerate(tasks)]
+
+    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+    with open(OUTPUT_PATH, "w") as f:
+        json.dump(results, f, ensure_ascii=False, indent=1)
     print(f"done in {time.time()-START:.0f}s", flush=True)
 
 
@@ -498,10 +427,13 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
+        # never exit non-zero without writing *something*
         print(f"[fatal] {e}", file=sys.stderr)
-    # Always leave a valid results file behind, whatever happened above.
-    try:
-        write_output()
-    except Exception as e2:
-        print(f"[output fatal] {e2}", file=sys.stderr)
+        try:
+            os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+            if not os.path.exists(OUTPUT_PATH):
+                with open(OUTPUT_PATH, "w") as f:
+                    json.dump([], f)
+        except Exception:
+            pass
     sys.exit(0)

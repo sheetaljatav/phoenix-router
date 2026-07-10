@@ -1,6 +1,6 @@
 # lablab.ai Submission Draft — Track 1
 
-**Project title:** ZeroToken Router
+**Project title:** Phoenix Router
 
 **Short description (tagline):**
 A hybrid routing agent that answers all 8 task categories with a bundled
@@ -9,7 +9,7 @@ and a Fireworks safety net it almost never needs.
 
 **Long description:**
 
-ZeroToken Router is built around the one number that decides the Track 1
+Phoenix Router is built around the one number that decides the Track 1
 leaderboard: total Fireworks tokens. The rules state local inference inside
 the container counts fully toward accuracy but zero toward the token score —
 so the optimal router is one that never has to leave the box.

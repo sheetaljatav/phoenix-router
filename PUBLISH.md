@@ -12,24 +12,24 @@ public GitHub repo — one account, one token.
 
 ## 2. Create the repo (you, ~1 min)
 
-1. https://github.com/new → name: `zerotoken-router`, Public, no README
+1. https://github.com/new → name: `phoenix-router`, Public, no README
 2. Create.
 
 ## 3. Push code + image (Claude runs these once you paste the token)
 
 ```powershell
 # code
-git remote add origin https://github.com/sheetaljatav/zerotoken-router.git
+git remote add origin https://github.com/sheetaljatav/phoenix-router.git
 git push -u origin main
 
 # image
 docker login ghcr.io -u sheetaljatav        # password = the token
-docker tag zerotoken-router:latest ghcr.io/sheetaljatav/zerotoken-router:latest
-docker push ghcr.io/sheetaljatav/zerotoken-router:latest
+docker tag phoenix-router:latest ghcr.io/sheetaljatav/phoenix-router:latest
+docker push ghcr.io/sheetaljatav/phoenix-router:latest
 ```
 
 Then make the package public (required so judges can pull it):
-https://github.com/users/sheetaljatav/packages/container/zerotoken-router/settings
+https://github.com/users/sheetaljatav/packages/container/phoenix-router/settings
 → Danger Zone → Change visibility → Public.
 
 ## 4. Submit on lablab.ai
@@ -38,12 +38,12 @@ On the hackathon page → your team → Submit:
 
 - Title / descriptions: copy from `SUBMISSION.md`
 - Cover image: `assets/cover.png`
-- Slides: `assets/ZeroToken-Router-deck.pdf` (or .pptx)
+- Slides: `assets/Phoenix-Router-deck.pdf` (or .pptx)
 - Video: record 1-2 min (screen-record the README + a container run;
   phone camera or OBS both fine — judges only need to see it working)
-- GitHub repo: https://github.com/sheetaljatav/zerotoken-router
+- GitHub repo: https://github.com/sheetaljatav/phoenix-router
 - Docker image (the field the evaluator pulls):
-  `ghcr.io/sheetaljatav/zerotoken-router:latest`
+  `ghcr.io/sheetaljatav/phoenix-router:latest`
 
 Deadline: **July 11** (check the Event Schedule tab for local-time cutoff).
 Submissions are rate-limited to 10/hour, and the leaderboard shows results —
