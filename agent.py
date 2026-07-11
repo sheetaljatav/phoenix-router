@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import time
+import urllib.error
 import urllib.request
 
 START = time.time()
@@ -133,8 +134,17 @@ def post_json(url: str, payload: dict, headers: dict, timeout: int):
         data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json", **headers},
     )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        # surface the server's error body - it names the real problem
+        # (bad model id, bad path, auth) in the container logs
+        try:
+            body = e.read()[:300].decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        raise RuntimeError(f"HTTP {e.code} {url}: {body}") from None
 
 
 def clean(text: str) -> str:
@@ -278,18 +288,89 @@ def checked_code(local, prompt, cfg, budget):
 # -------------------------------------------------------- fireworks fallback
 
 def fireworks_models():
-    models = [m.strip() for m in os.environ.get("ALLOWED_MODELS", "").split(",") if m.strip()]
-    # the leaderboard metric is raw TOKENS, not dollars: a big model costs
-    # the same tokens as a small one, so capability is free - prefer the
-    # LARGEST model by parameter-count hints in the id
+    """Parse ALLOWED_MODELS tolerantly: comma/semicolon/whitespace separated
+    or a JSON array, with optional quotes. Returns largest-first: the
+    leaderboard metric is raw TOKENS, not dollars, so capability is free."""
+    raw = os.environ.get("ALLOWED_MODELS", "").strip()
+    models = []
+    if raw.startswith("["):
+        try:
+            models = [str(m).strip() for m in json.loads(raw)]
+        except Exception:
+            pass
+    if not models:
+        models = [m.strip().strip("\"'") for m in re.split(r"[,;\n]+", raw)]
+    models = [m for m in models if m]
+
     def size_key(mid):
         hits = re.findall(r"(\d+(?:\.\d+)?)[bB]\b", mid)
         return max([float(h) for h in hits], default=0.0)
     return sorted(models, key=size_key, reverse=True)
 
 
-# discovered-good endpoint path + consecutive-failure circuit breaker
-FW_STATE = {"path": None, "fails": 0, "tokens": 0}
+# discovered-good endpoint/model (pinned by preflight) + failure breaker
+FW_STATE = {"path": None, "model": None, "fails": 0, "tokens": 0}
+
+
+def fw_paths(base):
+    """Candidate suffixes for the chat-completions endpoint, covering every
+    plausible FIREWORKS_BASE_URL shape the harness might inject."""
+    if base.endswith("/chat/completions"):
+        return [""]
+    if base.endswith("/v1"):
+        return ["/chat/completions"]
+    return ["/chat/completions", "/v1/chat/completions"]
+
+
+def fw_model_candidates():
+    """Allowed models, plus accounts/-prefix variants: some deployments
+    list bare ids, the Fireworks API wants fully-qualified ones (or the
+    reverse)."""
+    models = fireworks_models()
+    out = list(models)
+    for m in models[:3]:
+        if "/" not in m:
+            out.append(f"accounts/fireworks/models/{m}")
+        elif m.startswith("accounts/") and m.count("/") >= 2:
+            out.append(m.rsplit("/", 1)[-1])
+    return out
+
+
+def fw_preflight():
+    """Spend ~2 tokens to discover a (path, model) pair that returns VISIBLE
+    text, then pin it for the whole run. A reasoning model burns the tiny
+    budget inside <think> and yields empty content, so this also filters
+    thinking models that would blank out terse real tasks."""
+    base = os.environ.get("FIREWORKS_BASE_URL", "").rstrip("/")
+    key = os.environ.get("FIREWORKS_API_KEY", "")
+    if not base or not fireworks_models():
+        print("[fw preflight] not configured", flush=True)
+        return False
+    last_err = None
+    for path in fw_paths(base):
+        for model in fw_model_candidates():
+            if DEADLINE - time.time() < 90:
+                break
+            try:
+                out = post_json(base + path, {
+                    "model": model,
+                    "messages": [{"role": "user", "content": "Say OK"}],
+                    "max_tokens": 4,
+                    "temperature": 0.0,
+                }, {"Authorization": f"Bearer {key}",
+                    "x-api-key": key}, timeout=8)
+                FW_STATE["tokens"] += out.get("usage", {}).get("total_tokens", 0)
+                text = clean(out["choices"][0]["message"].get("content") or "")
+                if text:
+                    FW_STATE["path"], FW_STATE["model"] = path, model
+                    print(f"[fw preflight] ok path={path or '(base)'} "
+                          f"model={model}", flush=True)
+                    return True
+                last_err = f"{model}: empty content (thinking model?)"
+            except Exception as e:
+                last_err = f"{model}: {e}"
+    print(f"[fw preflight] ALL FAILED; last: {last_err}", flush=True)
+    return False
 
 # categories routed to Fireworks even when the local model is healthy
 # (accuracy-critical); everything else stays local at zero tokens
@@ -353,22 +434,20 @@ def safe_eval(text):
 def ask_fireworks(prompt, sys_prompt, max_tokens):
     base = os.environ.get("FIREWORKS_BASE_URL", "").rstrip("/")
     key = os.environ.get("FIREWORKS_API_KEY", "")
-    models = fireworks_models()
-    if not base or not models:
+    if not base or not fireworks_models():
         raise RuntimeError("fireworks not configured")
-    if FW_STATE["fails"] >= 3:
+    if FW_STATE["fails"] >= 5:
         raise RuntimeError("fireworks circuit open")
-    # the harness may hand us a base with or without /v1 - probe both once,
-    # then stick with whichever worked
-    if FW_STATE["path"]:
-        paths = [FW_STATE["path"]]
-    elif base.endswith("/v1"):
-        paths = ["/chat/completions"]
-    else:
-        paths = ["/chat/completions", "/v1/chat/completions"]
+    paths = [FW_STATE["path"]] if FW_STATE["path"] is not None \
+        else fw_paths(base)
+    # pinned-good model first, then the other candidates
+    models = fw_model_candidates()
+    if FW_STATE["model"]:
+        models = [FW_STATE["model"]] + \
+            [m for m in models if m != FW_STATE["model"]]
     last_err = None
     for path in paths:
-        for model in models[:2]:
+        for model in models[:3]:
             if DEADLINE - time.time() < 10:
                 raise RuntimeError("out of time")
             try:
@@ -380,14 +459,35 @@ def ask_fireworks(prompt, sys_prompt, max_tokens):
                     ],
                     "max_tokens": max_tokens,
                     "temperature": 0.0,
-                }, {"Authorization": f"Bearer {key}"}, timeout=20)
+                }, {"Authorization": f"Bearer {key}",
+                    "x-api-key": key}, timeout=20)
                 usage = out.get("usage", {})
                 FW_STATE["tokens"] += usage.get("total_tokens", 0)
-                text = clean(out["choices"][0]["message"]["content"])
+                choice = out["choices"][0]
+                text = clean(choice["message"].get("content") or "")
+                if not text and choice.get("finish_reason") == "length" \
+                        and DEADLINE - time.time() > 30:
+                    # budget swallowed by hidden reasoning: pay once for a
+                    # bigger window rather than return nothing
+                    out = post_json(base + path, {
+                        "model": model,
+                        "messages": [
+                            {"role": "system", "content": sys_prompt},
+                            {"role": "user", "content": prompt},
+                        ],
+                        "max_tokens": max(600, max_tokens * 4),
+                        "temperature": 0.0,
+                    }, {"Authorization": f"Bearer {key}",
+                        "x-api-key": key}, timeout=25)
+                    FW_STATE["tokens"] += out.get("usage", {}).get(
+                        "total_tokens", 0)
+                    text = clean(out["choices"][0]["message"].get(
+                        "content") or "")
                 if text:
-                    FW_STATE["path"] = path
+                    FW_STATE["path"], FW_STATE["model"] = path, model
                     FW_STATE["fails"] = 0
                     return text
+                last_err = RuntimeError(f"{model}: empty content")
             except Exception as e:
                 last_err = e
     FW_STATE["fails"] += 1
@@ -527,6 +627,7 @@ def main():
           f"fw_base={'set' if os.environ.get('FIREWORKS_BASE_URL') else 'MISSING'} "
           f"fw_key={'set' if os.environ.get('FIREWORKS_API_KEY') else 'MISSING'} "
           f"allowed_models={len(fireworks_models())}", flush=True)
+    fw_preflight()
 
     # easy (no-think) categories first: if time gets tight, only the
     # reasoning-heavy tasks see shrunken budgets
