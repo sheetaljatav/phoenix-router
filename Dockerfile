@@ -1,15 +1,8 @@
-# linux/amd64 — required by the judging VM
-FROM ghcr.io/ggml-org/llama.cpp:server
-
-RUN apt-get update \
- && apt-get install -y --no-install-recommends python3 \
- && rm -rf /var/lib/apt/lists/*
-
-# model weights: Qwen3.5-2B (Apache-2.0), Unsloth dynamic Q4_K_XL (~1.3 GB)
-RUN mkdir -p /models \
- && curl -fL --retry 3 -o /models/model.gguf \
-    https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-UD-Q4_K_XL.gguf
-
+# linux/amd64 - slim API-routing build (no bundled model).
+# The agent routes tasks through the harness's Fireworks proxy with
+# token-frugal prompting; LLAMA_WAIT_S=5 makes the (absent) local-model
+# probe a no-op. Rebuild from the llama.cpp base to restore local mode.
+FROM python:3.12-slim
+ENV LLAMA_WAIT_S=5
 COPY agent.py run.sh /app/
-
 ENTRYPOINT ["/bin/sh", "/app/run.sh"]
