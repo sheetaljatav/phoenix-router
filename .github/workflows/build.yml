@@ -23,9 +23,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64
-          push: true
-          tags: ghcr.io/${{ github.repository_owner }}/phoenix-router:latest
+      # Publish a classic Docker v2 (schema2) manifest — NOT an OCI image
+      # index — so any standard docker/containerd puller (including the
+      # hackathon judge) can pull it. Without this, buildx wraps the image
+      # in an OCI index + attestation manifest, and pullers that request the
+      # Docker manifest media type get a 404 (the PULL_ERROR we hit).
+      #   provenance=false        -> drop the attestation manifest (no index)
+      #   oci-mediatypes=false    -> emit Docker schema2 media types
+      - name: Build and push (Docker schema2, maximally compatible)
+        run: |
+          IMG=ghcr.io/${{ github.repository_owner }}/phoenix-router:latest
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false \
+            --output type=registry,oci-mediatypes=false \
+            --tag "$IMG" \
+            .
