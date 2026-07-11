@@ -26,7 +26,7 @@ OUTPUT_PATH = os.environ.get("OUTPUT_PATH", "/output/results.json")
 # ---------------------------------------------------------------- categories
 
 CATEGORIES = (
-    # (name, compiled regex) ‚Äî first match wins, most specific first
+    # (name, compiled regex) - first match wins, most specific first
     ("summarization", re.compile(r"\bsummar|\bcondense|\btl;?dr|\babridge|\bshorten\b|\bmain (points?|ideas?)\b|\bkey takeaways?\b", re.I)),
     ("ner", re.compile(r"named entit|entit(y|ies)\b|\b(identify|list|find|extract|label)\b.*\b(people|persons?|organi[sz]ations?|locations?|dates)\b|\b(people|persons?|organi[sz]ations?|locations?|dates)\b.*\b(identify|list|find|extract|label)", re.I | re.S)),
     ("sentiment", re.compile(r"\bsentiment\b|classify.*\b(review|tweet|feedback|comment)|positive.*negative", re.I)),
@@ -295,7 +295,7 @@ def ask_fireworks(prompt, cfg):
         raise RuntimeError("fireworks not configured")
     if FW_STATE["fails"] >= 3:
         raise RuntimeError("fireworks circuit open")
-    # the harness may hand us a base with or without /v1 ‚Äî probe both once,
+    # the harness may hand us a base with or without /v1 - probe both once,
     # then stick with whichever worked
     if FW_STATE["path"]:
         paths = [FW_STATE["path"]]
@@ -389,7 +389,7 @@ def solve(task, local, tasks_left):
                           file=sys.stderr)
 
     if not answer and DEADLINE - time.time() > 10:
-        # safety net ‚Äî the only path that spends Fireworks tokens
+        # safety net - the only path that spends Fireworks tokens
         try:
             answer = ask_fireworks(prompt, cfg)
         except Exception as e:
@@ -398,9 +398,24 @@ def solve(task, local, tasks_left):
     return answer or "Unable to answer within constraints."
 
 
+def load_tasks():
+    """Read /input/tasks.json, tolerating shape deviations: a dict wrapper
+    ({"tasks": [...]}) or junk entries must never zero out the whole run."""
+    try:
+        with open(INPUT_PATH) as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"[load_tasks] {e}", file=sys.stderr)
+        return []
+    if isinstance(data, dict):
+        data = data.get("tasks", [])
+    if not isinstance(data, list):
+        return []
+    return [t if isinstance(t, dict) else {} for t in data]
+
+
 def main():
-    with open(INPUT_PATH) as f:
-        tasks = json.load(f)
+    tasks = load_tasks()
 
     local = Local()
     local.ok = local.wait()
