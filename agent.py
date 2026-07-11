@@ -7,6 +7,7 @@ ALLOWED_MODELS) exists purely as a safety net: it fires only if the local
 model fails or the 10-minute runtime budget is about to be exceeded.
 """
 
+import ast
 import json
 import os
 import re
@@ -152,9 +153,11 @@ class Local:
 
     def wait(self, timeout=None):
         # cap the health wait well below the run budget: if the server is
-        # not up in 4 min it never will be, and the remaining ~5 min must
-        # go to the Fireworks fallback instead of more polling
-        end = min(DEADLINE - 60, time.time() + 240) \
+        # not up in time it never will be, and the rest of the budget must
+        # go to the Fireworks path instead of more polling. Slim builds
+        # ship no llama-server and set LLAMA_WAIT_S low to skip fast.
+        wait_s = float(os.environ.get("LLAMA_WAIT_S", "240"))
+        end = min(DEADLINE - 60, time.time() + wait_s) \
             if timeout is None else time.time() + timeout
         up = False
         while time.time() < end:
@@ -276,18 +279,78 @@ def checked_code(local, prompt, cfg, budget):
 
 def fireworks_models():
     models = [m.strip() for m in os.environ.get("ALLOWED_MODELS", "").split(",") if m.strip()]
-    # prefer the smallest/cheapest model by parameter-count hints in the id
+    # the leaderboard metric is raw TOKENS, not dollars: a big model costs
+    # the same tokens as a small one, so capability is free - prefer the
+    # LARGEST model by parameter-count hints in the id
     def size_key(mid):
         hits = re.findall(r"(\d+(?:\.\d+)?)[bB]\b", mid)
-        return min([float(h) for h in hits], default=999.0)
-    return sorted(models, key=size_key)
+        return max([float(h) for h in hits], default=0.0)
+    return sorted(models, key=size_key, reverse=True)
 
 
 # discovered-good endpoint path + consecutive-failure circuit breaker
-FW_STATE = {"path": None, "fails": 0}
+FW_STATE = {"path": None, "fails": 0, "tokens": 0}
+
+# categories routed to Fireworks even when the local model is healthy
+# (accuracy-critical); everything else stays local at zero tokens
+HARD_CATS = set(c for c in os.environ.get(
+    "ROUTE_FW", "math,logic,code_debug,code_gen").split(",") if c)
+
+# terse per-category prompting for the metered path: every system-prompt
+# token and completion token counts against the leaderboard score
+FW_CONFIG = {
+    "factual":       ("Answer in one concise sentence.", 60),
+    "math":          ("Reply with one Python arithmetic expression that "
+                      "computes the answer. No words, no code fences.", 80),
+    "sentiment":     ("Reply with one label - Positive, Negative, Neutral "
+                      "or Mixed - plus one brief reason.", 40),
+    "summarization": ("Follow the requested format and length exactly. "
+                      "No preamble.", 120),
+    "ner":           ("List each entity as 'Entity - Type', one per line. "
+                      "Nothing else.", 90),
+    "code_debug":    ("Name the bug in one sentence, then give corrected "
+                      "code in a ```python block.", 350),
+    "logic":         ("Reason in at most 3 short sentences, then a final "
+                      "line: Answer: <result>", 150),
+    "code_gen":      ("Return only the solution code in a ```python "
+                      "block.", 350),
+}
+
+_SAFE_NODES = (ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant,
+               ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod,
+               ast.Pow, ast.USub, ast.UAdd)
 
 
-def ask_fireworks(prompt, cfg):
+def safe_eval(text):
+    """Evaluate a model-emitted arithmetic expression. Returns None unless
+    the text is purely arithmetic (no names, no calls, bounded pow)."""
+    expr = text.strip().strip("`").strip()
+    lines = [l.strip() for l in expr.splitlines() if l.strip()]
+    if not lines:
+        return None
+    expr = lines[-1].rstrip(".")
+    if "=" in expr:
+        expr = expr.split("=")[-1].strip()
+    try:
+        tree = ast.parse(expr, mode="eval")
+        for node in ast.walk(tree):
+            if not isinstance(node, _SAFE_NODES):
+                return None
+            if isinstance(node, ast.Pow):
+                r = node.right
+                if not (isinstance(r, ast.Constant) and abs(r.value) <= 8):
+                    return None
+        val = eval(compile(tree, "<expr>", "eval"), {"__builtins__": {}}, {})
+    except Exception:
+        return None
+    if isinstance(val, float) and val.is_integer():
+        val = int(val)
+    if isinstance(val, float):
+        val = round(val, 6)
+    return val
+
+
+def ask_fireworks(prompt, sys_prompt, max_tokens):
     base = os.environ.get("FIREWORKS_BASE_URL", "").rstrip("/")
     key = os.environ.get("FIREWORKS_API_KEY", "")
     models = fireworks_models()
@@ -305,19 +368,21 @@ def ask_fireworks(prompt, cfg):
         paths = ["/chat/completions", "/v1/chat/completions"]
     last_err = None
     for path in paths:
-        for model in models[:3]:
+        for model in models[:2]:
             if DEADLINE - time.time() < 10:
                 raise RuntimeError("out of time")
             try:
                 out = post_json(base + path, {
                     "model": model,
                     "messages": [
-                        {"role": "system", "content": cfg["sys"]},
+                        {"role": "system", "content": sys_prompt},
                         {"role": "user", "content": prompt},
                     ],
-                    "max_tokens": min(cfg["max_tokens"], 600),
-                    "temperature": 0.2,
+                    "max_tokens": max_tokens,
+                    "temperature": 0.0,
                 }, {"Authorization": f"Bearer {key}"}, timeout=20)
+                usage = out.get("usage", {})
+                FW_STATE["tokens"] += usage.get("total_tokens", 0)
                 text = clean(out["choices"][0]["message"]["content"])
                 if text:
                     FW_STATE["path"] = path
@@ -329,21 +394,58 @@ def ask_fireworks(prompt, cfg):
     raise last_err or RuntimeError("fireworks failed")
 
 
+def solve_fireworks(prompt, cat):
+    """Answer one task through the metered proxy, token-frugally."""
+    sys_p, mt = FW_CONFIG[cat]
+    if cat == "math":
+        # PAL: the model emits a tiny arithmetic expression (~15 tokens),
+        # we execute it locally - deterministic arithmetic, minimal spend
+        raw = ask_fireworks(prompt, sys_p, mt)
+        val = safe_eval(raw)
+        if val is not None:
+            return f"{raw.strip()} = {val}\nAnswer: {val}"
+        return ask_fireworks(
+            prompt, "Solve concisely. End with a final line: "
+            "Answer: <result>", 150)
+    answer = ask_fireworks(prompt, sys_p, mt)
+    if cat in ("code_gen", "code_debug") and answer \
+            and not python_code_ok(answer) and DEADLINE - time.time() > 30:
+        retry = ask_fireworks(
+            prompt + "\n\n(The previous attempt had a syntax error; "
+            "return corrected code.)", sys_p, mt)
+        if retry and python_code_ok(retry):
+            return retry
+    return answer
+
+
 # -------------------------------------------------------------------- main
 
 def solve(task, local, tasks_left):
     prompt = task.get("prompt", "")
-    cfg = CONFIG[classify(prompt)]
-    remaining = DEADLINE - time.time()
+    cat = classify(prompt)
+    cfg = CONFIG[cat]
     answer = ""
 
-    if local.ok and remaining > 15:
+    # routing policy: accuracy-critical categories go to the big Fireworks
+    # model (metered, terse); the rest go local when a local model exists.
+    # With no local model (slim build) everything goes through Fireworks.
+    fw_ready = bool(os.environ.get("FIREWORKS_BASE_URL")) \
+        and bool(fireworks_models()) and FW_STATE["fails"] < 3
+    fw_first = fw_ready and (not local.ok or cat in HARD_CATS)
+
+    if fw_first and DEADLINE - time.time() > 15:
+        try:
+            answer = solve_fireworks(prompt, cat)
+        except Exception as e:
+            print(f"[fw fail] {task.get('task_id')}: {e}", file=sys.stderr)
+
+    remaining = DEADLINE - time.time()
+    if not answer and local.ok and remaining > 15:
         # token budget: fair share of remaining wall time at measured speed,
         # clamped so one generation can never outrun the per-request cap
         share = min(max(6.0, remaining / max(tasks_left, 1)), 500.0)
         budget = int(min(cfg["max_tokens"], max(120, share * local.tps)))
         think = cfg["think"] and budget >= 500
-        cat = classify(prompt)
         time_rich = remaining / max(tasks_left, 1) > 45
         try:
             # all categories answer at temperature 0: deterministic output,
@@ -388,10 +490,11 @@ def solve(task, local, tasks_left):
                     print(f"[local retry fail] {task.get('task_id')}: {e2}",
                           file=sys.stderr)
 
-    if not answer and DEADLINE - time.time() > 10:
-        # safety net - the only path that spends Fireworks tokens
+    if not answer and fw_ready and not fw_first \
+            and DEADLINE - time.time() > 10:
+        # local-was-primary safety net: spend tokens rather than blank out
         try:
-            answer = ask_fireworks(prompt, cfg)
+            answer = solve_fireworks(prompt, cat)
         except Exception as e:
             print(f"[fireworks fail] {task.get('task_id')}: {e}", file=sys.stderr)
 
@@ -444,7 +547,8 @@ def main():
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
     with open(OUTPUT_PATH, "w") as f:
         json.dump(results, f, ensure_ascii=False, indent=1)
-    print(f"done in {time.time()-START:.0f}s", flush=True)
+    print(f"done in {time.time()-START:.0f}s "
+          f"fw_tokens={FW_STATE['tokens']}", flush=True)
 
 
 if __name__ == "__main__":
