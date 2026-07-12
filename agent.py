@@ -372,21 +372,13 @@ def fw_model_candidates():
     return out
 
 
-def fw_preflight():
-    """Spend ~2 tokens to discover a (path, model) pair that returns VISIBLE
-    text, then pin it for the whole run. A reasoning model burns the tiny
-    budget inside <think> and yields empty content, so this also filters
-    thinking models that would blank out terse real tasks."""
-    base = os.environ.get("FIREWORKS_BASE_URL", "").rstrip("/")
-    key = os.environ.get("FIREWORKS_API_KEY", "")
-    if not base or not fireworks_models():
-        print("[fw preflight] not configured", flush=True)
-        return False
+def _preflight_sweep(base, key):
+    """One pass over path and model candidates. Returns (ok, last_err)."""
     last_err = None
     for path in fw_paths(base):
         for model in fw_model_candidates():
             if DEADLINE - time.time() < 90:
-                break
+                return False, last_err
             try:
                 out = post_json(base + path, {
                     "model": model,
@@ -399,16 +391,58 @@ def fw_preflight():
                 text = clean(out["choices"][0]["message"].get("content") or "")
                 if text:
                     FW_STATE["path"], FW_STATE["model"] = path, model
-                    print(f"[fw preflight] ok path={path or '(base)'} "
-                          f"model={model}", flush=True)
-                    beacon("preflight", ok=True, path=path or "(base)",
-                           model=model)
-                    return True
+                    return True, None
                 last_err = f"{model}: empty content (thinking model?)"
             except Exception as e:
                 last_err = f"{model}: {e}"
-    print(f"[fw preflight] ALL FAILED; last: {last_err}", flush=True)
-    beacon("preflight", ok=False, err=str(last_err)[:300])
+                if "refused" in str(e).lower():
+                    # nothing is listening yet - no point trying the
+                    # other candidates against the same dead endpoint
+                    return False, last_err
+    return False, last_err
+
+
+def fw_preflight():
+    """Discover and pin a working (path, model) pair for ~2 tokens.
+
+    The metering proxy is a sidecar that can come up AFTER this container
+    starts (observed live: every call in the first seconds gets ECONNREFUSED,
+    beacon evidence 2026-07-12). Sweep with backoff for up to ~5 minutes
+    instead of concluding dead - the 19-task run itself only needs ~2 min."""
+    base = os.environ.get("FIREWORKS_BASE_URL", "").rstrip("/")
+    key = os.environ.get("FIREWORKS_API_KEY", "")
+    if not base or not fireworks_models():
+        print("[fw preflight] not configured", flush=True)
+        return False
+    window_end = min(START + 330, DEADLINE - 180)
+    attempt = 0
+    last_err = None
+    while True:
+        attempt += 1
+        ok, last_err = _preflight_sweep(base, key)
+        if ok:
+            print(f"[fw preflight] ok attempt={attempt} "
+                  f"path={FW_STATE['path'] or '(base)'} "
+                  f"model={FW_STATE['model']}", flush=True)
+            beacon("preflight", ok=True, attempt=attempt,
+                   path=FW_STATE["path"] or "(base)",
+                   model=FW_STATE["model"])
+            return True
+        connection_issue = any(s in str(last_err).lower() for s in
+                               ("refused", "timed out", "unreachable",
+                                "reset", "name or service"))
+        if time.time() >= window_end:
+            break
+        if not connection_issue and attempt >= 2:
+            break  # proxy is up but rejects us; waiting won't change that
+        if attempt == 1:
+            print(f"[fw preflight] waiting for proxy: {last_err}",
+                  flush=True)
+            beacon("preflight_waiting", err=str(last_err)[:200])
+        time.sleep(8)
+    print(f"[fw preflight] ALL FAILED after {attempt} sweeps; "
+          f"last: {last_err}", flush=True)
+    beacon("preflight", ok=False, attempts=attempt, err=str(last_err)[:300])
     return False
 
 # categories routed to Fireworks even when the local model is healthy
@@ -545,6 +579,9 @@ def ask_fireworks(prompt, sys_prompt, max_tokens):
                 last_err = RuntimeError(f"{model}: empty content")
             except Exception as e:
                 last_err = e
+                if "refused" in str(e).lower() \
+                        and DEADLINE - time.time() > 60:
+                    time.sleep(2)  # transient proxy blip mid-run
     FW_STATE["fails"] += 1
     raise last_err or RuntimeError("fireworks failed")
 
